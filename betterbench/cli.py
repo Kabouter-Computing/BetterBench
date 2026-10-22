@@ -193,6 +193,17 @@ def cmd_run(args):
             print("high-context decode: skipped (no corpus to draw task prompts from)")
         elif cfg.high_ctx_categories:
             hctx_cats = list(cfg.high_ctx_categories)
+            # The corpus is filtered by --categories, so an explicit
+            # --high-ctx-categories can name a category that was never loaded.
+            # Fail loud rather than silently measuring nothing: the banner and
+            # the recorded config would otherwise claim a decode that never ran.
+            missing = [c for c in hctx_cats if c not in corpus]
+            if missing:
+                sys.exit(f"--high-ctx-categories requested {', '.join(missing)} "
+                         f"but it is not in the loaded corpus "
+                         f"({', '.join(corpus)}). The corpus is filtered by "
+                         f"--categories {args.categories or '(all)'} — add the "
+                         f"category there, or drop the filter.")
         elif args.quick:
             hctx_cats = [next(iter(corpus))]
         else:

@@ -163,10 +163,11 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
         need = depth + cfg.prefill_max_tokens + cfg.prefill_ctx_margin
         if max_ctx is not None and need > max_ctx:
             log(f"[prefill] skip depth ~{depth}: needs ~{need} tok > model context {max_ctx}")
-            out.append(skip_row(depth, f"exceeds max context {max_ctx} (needs ~{need} tok)"))
+            reason = f"exceeds max context {max_ctx} (needs ~{need} tok)"
+            out.append(skip_row(depth, reason))
             if do_hctx:
                 hctx_out.append(_hctx_skip_row(depth, high_ctx_categories,
-                                               "prefill depth skipped"))
+                                               f"prefill depth skipped: {reason}"))
             continue
 
         # The decode needs more headroom than the prefill probe (a larger
@@ -236,8 +237,9 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
                 f"exceeded){'' if max_ctx else '; consider --max-model-len'}")
             out.append(skip_row(depth, "server rejected: exceeds context length"))
             if do_hctx:
-                hctx_out.append(_hctx_skip_row(depth, high_ctx_categories,
-                                               "prefill depth skipped"))
+                hctx_out.append(_hctx_skip_row(
+                    depth, high_ctx_categories,
+                    "prefill depth skipped: server rejected (context length exceeded)"))
             continue
 
         measured = recs[cfg.prefill_warmup:]          # drop warmup

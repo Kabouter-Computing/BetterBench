@@ -3,9 +3,12 @@
 ## 0.7.0
 
 **Upgrading:** `betterbench run` is now a little longer — each prefill pass is followed by a
-short decode against the same context (the new high-context decode, on by default). Disable it
-with `--no-high-ctx-decode` to get the old run length. `results.json` gains a `high_ctx_decode`
-section; older files render fine without it.
+short decode against the same context (the new high-context decode, on by default). At the
+defaults (5 depths × 10 passes × 256 decode tokens) that is on the order of ten minutes of
+extra wall time at ~20 t/s. Disable it with `--no-high-ctx-decode` to get the old run length.
+`results.json` gains a `high_ctx_decode` section; older files render fine without it. The
+library API changes too: `runner.prefill_sweep` now returns
+`(prefill_rows, high_ctx_decode_rows)` rather than a single list.
 
 ### Added
 
@@ -19,8 +22,10 @@ section; older files render fine without it.
   percentiles join the `sample_gate` honesty check.
   - `--no-high-ctx-decode` turns it off (auto-off when `--no-prefill` is set, since there is
     then no context to reuse).
-  - `--high-ctx-categories CAT…` picks a category mix independent of the main decode; by
-    default it uses the main decode's categories, or just the first of them under `--quick`.
+  - `--high-ctx-categories CAT…` is a category mix independent of the main decode; by
+    default it uses the main decode's categories, or just the alphabetically first of
+    them under `--quick`. Requesting a category the loaded corpus (as filtered by
+    `--categories`) does not contain is an error, not a silent no-op.
   - `high_ctx_decode_tokens` (config file, default 256) sets how many tokens each pass decodes.
 
 ## 0.6.1

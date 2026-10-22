@@ -277,7 +277,7 @@ def high_ctx_decode_rows(results: dict) -> list[dict]:
             "target_depth": d["target_depth"], "skipped": False,
             "categories": d.get("categories", []),
             "runs": d.get("runs", 0),
-            "decode_med": dd.median, "decode_iqr": dd.iqr, "decode_cv": dd.cv,
+            "decode_med": dd.median, "decode_iqr": dd.iqr,
             "ttft_p50": td.median, "ttft_n": td.n,
             "ttft_p99_ok": enough_samples_for_percentile(td.n, 99),
             "gap_n": len(gaps),

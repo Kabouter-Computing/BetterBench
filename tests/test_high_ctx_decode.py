@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from betterbench.client import RunResult
 from betterbench.config import Config
 from betterbench.corpus import Prompt
@@ -215,14 +217,78 @@ def test_no_prefill_auto_disables_high_ctx_decode(server, tmp_path):
 def test_quick_uses_only_the_first_category(server, tmp_path):
     res = _run(server, tmp_path, "--quick")
     cats = res["high_ctx_decode"][0]["categories"]
-    assert len(cats) == 1
-    # The first category is the first in the (sorted) corpus.
-    assert cats == [sorted(cats)[0]]
+    # --quick uses the alphabetically first corpus category, not all of them.
+    assert cats == ["chat"]
 
 
 def test_explicit_high_ctx_categories_win(server, tmp_path):
     res = _run(server, tmp_path, "--high-ctx-categories", "code", "json")
     assert res["high_ctx_decode"][0]["categories"] == ["code", "json"]
+
+
+def test_high_ctx_categories_disjoint_from_corpus_is_an_error(server, tmp_path):
+    """Requesting a category the loaded corpus (filtered by --categories) does
+    not contain is an error, not a silent no-op."""
+    from betterbench.cli import main
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(FAST))
+    out = tmp_path / "r.json"
+    with pytest.raises(SystemExit):
+        main(["run", "--endpoint", server(), "--model", "mock",
+              "--config", str(cfg_path), "--out", str(out), "--no-html",
+              "--prefill", "--categories", "prose",
+              "--high-ctx-categories", "code"])
+
+
+def test_hctx_fits_precheck_skips_decode_not_prefill(monkeypatch):
+    """When the window is known and the decode exceeds it but the prefill does
+    not, the prefill row is complete and only the decode is skipped — with no
+    rejected request on the wire."""
+    calls: list[tuple[list[dict], int]] = []
+
+    async def fake_stream_chat(endpoint, model, messages, **kw):
+        calls.append((messages, kw.get("max_tokens", 0)))
+        return _ok_result()
+
+    monkeypatch.setattr(runner, "stream_chat", fake_stream_chat)
+    cfg = Config()
+    cfg.prefill_depths = [200]
+    cfg.prefill_runs = 2
+    cfg.prefill_warmup = 0
+    cfg.high_ctx_decode_tokens = 64
+    cfg.run_high_ctx_decode = True
+    # Window fits the prefill (200 + 16 + 256 = 472) but not the decode
+    # (200 + 64 + 256 = 520).
+    prefill_rows, hctx_rows = asyncio.run(
+        runner.prefill_sweep("http://x", "m", cfg, max_ctx=500, corpus=_corpus(),
+                             high_ctx_categories=["code"]))
+    # Only the prefill ran — no decode request was sent.
+    assert all(mt <= 16 for _, mt in calls)
+    assert len(prefill_rows) == 1 and not prefill_rows[0].get("skipped")
+    assert len(hctx_rows) == 1 and hctx_rows[0]["skipped"]
+    assert "max context" in hctx_rows[0]["reason"]
+
+
+def test_sample_gate_covers_high_ctx_decode(server, tmp_path):
+    from betterbench.report import sample_gate
+    res = _run(server, tmp_path)
+    under = sample_gate(res)["under_sampled"]
+    # The high-context decode's percentiles are gated like every other section.
+    assert any(e["section"] == "high_ctx_decode" for e in under)
+
+
+def test_skipped_hctx_row_renders_in_both_reports(server, tmp_path):
+    from betterbench.html_report import render_html
+    from betterbench.report import render_markdown
+    # A tiny window makes the deepest prefill depth (and its decode) skip.
+    res = _run(server, tmp_path, cfg={"prefill_depths": [200, 100000],
+                                      "max_model_len": 1000})
+    md = render_markdown(res)
+    html = render_html(res)
+    assert "Decode at high context" in md
+    assert "_skipped_" in md
+    assert "Decode at high context" in html
+    assert "skipped" in html
 
 
 def test_prefill_only_with_empty_corpus_skips_decode(server, tmp_path):

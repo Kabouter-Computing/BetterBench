@@ -211,8 +211,8 @@ cost lands in the decode's TTFT, not its decode t/s). Either way the decode runs
 context in the KV cache — the RAG shape: long context, short answer. It reports decode t/s and
 the latency columns (ITL, or update gaps on a speculative server) at each depth. Off with
 `--no-high-ctx-decode` (auto-off when `--no-prefill` is set); `--high-ctx-categories` picks a
-different category mix than the main decode, and under `--quick` it measures just the first
-main-decode category.
+different category mix than the main decode, and under `--quick` it measures just the
+alphabetically first main-decode category.
 
 **Run length you control** — `--passes N` sets the measured passes per category (default 20)
 and `--warmup N` the discarded ones; both override whatever a `--config` file says. `--quick`

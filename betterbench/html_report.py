@@ -238,27 +238,34 @@ def _tables(rows, conc, pre, hctx, env, batched=False, rrows=()) -> list | str:
         hctx_batched = any(r.get("batched") for r in hctx if not r["skipped"])
         body = []
         for d in hctx:
-            cats = _esc(", ".join(d.get("categories", [])))
+            cats = _esc(", ".join(d.get("categories", []))) or "—"
             if d["skipped"]:
-                body.append([f"{int(d['target_depth']):,}", cats, "—", "—", "—",
-                             "<em>skipped</em>", "—"])
+                row = [f"{int(d['target_depth']):,}", cats, "—", "—", "—", "—"]
+                if hctx_batched:
+                    row += ["<em>skipped</em>", "—"]
+                else:
+                    row += ["<em>skipped</em>", "—", "—"]
+                body.append(row)
                 continue
             if hctx_batched:
                 body.append([f"{int(d['target_depth']):,}", cats, d["runs"],
                              _fmt(d["decode_med"]), _fmt(d["decode_iqr"]),
                              _fmt(d["ttft_p50"]),
+                             _fmt(d["update_p50"]),
                              _gate(d["update_p99"], d["tail_ok"])])
             else:
                 body.append([f"{int(d['target_depth']):,}", cats, d["runs"],
                              _fmt(d["decode_med"]), _fmt(d["decode_iqr"]),
                              _fmt(d["ttft_p50"]),
+                             _gate(d["itl_low1"], d["tail_ok"]),
+                             _fmt(d["itl_med"]),
                              _gate(d["itl_high99"], d["tail_ok"])])
         if hctx_batched:
             headers = ["target depth", "categories", "passes", "decode med",
-                       "±IQR", "TTFT p50", "update p99 (ms)"]
+                       "±IQR", "TTFT p50", "update p50 (ms)", "update p99 (ms)"]
         else:
             headers = ["target depth", "categories", "passes", "decode med",
-                       "±IQR", "TTFT p50", "ITL 99% high"]
+                       "±IQR", "TTFT p50", "ITL 1% low", "ITL med", "ITL 99% high"]
         out.append(_table(
             "Decode at high context · reuses each prefill pass's context",
             headers, body))
