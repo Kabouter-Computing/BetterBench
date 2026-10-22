@@ -198,9 +198,12 @@ def test_prefill_only_with_empty_corpus_skips_decode(server, tmp_path):
 
 
 def test_report_renders_the_high_ctx_section(server, tmp_path):
+    from betterbench.html_report import render_html
     from betterbench.report import render_markdown
     res = _run(server, tmp_path)
     md = render_markdown(res)
     assert "Decode at high context" in md
     # The section is keyed by the prefill depth.
     assert "200" in md and "400" in md
+    # The HTML report carries the same table.
+    assert "Decode at high context" in render_html(res)

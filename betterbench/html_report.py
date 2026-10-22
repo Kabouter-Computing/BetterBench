@@ -16,8 +16,8 @@ from datetime import datetime
 
 from . import __version__
 from .report import (PHASE_SECTIONS, cache_hits, combined_score, concurrency_rows,
-                     has_reasoning_evidence, phases_present, prefill_rows,
-                     reasoning_rows, report_is_batched, sample_gate,
+                     has_reasoning_evidence, high_ctx_decode_rows, phases_present,
+                     prefill_rows, reasoning_rows, report_is_batched, sample_gate,
                      single_rows, truncation_summary)
 
 
@@ -185,7 +185,7 @@ def _reasoning_table(rrows) -> list[str]:
                     "TTFA p50 (ms)", "never reached answer"], body)]
 
 
-def _tables(rows, conc, pre, env, batched=False, rrows=()) -> list | str:
+def _tables(rows, conc, pre, hctx, env, batched=False, rrows=()) -> list | str:
     out = []
     if rows and batched:
         out.append(_table(
@@ -234,6 +234,34 @@ def _tables(rows, conc, pre, env, batched=False, rrows=()) -> list | str:
             "Prefill sweep · cold prefix cache",
             ["target depth", "prompt tok med", "TTFT p50", "PP 1% low", "PP median", "PP 99% high"],
             body))
+    if hctx:
+        hctx_batched = any(r.get("batched") for r in hctx if not r["skipped"])
+        body = []
+        for d in hctx:
+            cats = _esc(", ".join(d.get("categories", [])))
+            if d["skipped"]:
+                body.append([f"{int(d['target_depth']):,}", cats, "—", "—", "—",
+                             "<em>skipped</em>", "—"])
+                continue
+            if hctx_batched:
+                body.append([f"{int(d['target_depth']):,}", cats, d["runs"],
+                             _fmt(d["decode_med"]), _fmt(d["decode_iqr"]),
+                             _fmt(d["ttft_p50"]),
+                             _gate(d["update_p99"], d["tail_ok"])])
+            else:
+                body.append([f"{int(d['target_depth']):,}", cats, d["runs"],
+                             _fmt(d["decode_med"]), _fmt(d["decode_iqr"]),
+                             _fmt(d["ttft_p50"]),
+                             _gate(d["itl_high99"], d["tail_ok"])])
+        if hctx_batched:
+            headers = ["target depth", "categories", "passes", "decode med",
+                       "±IQR", "TTFT p50", "update p99 (ms)"]
+        else:
+            headers = ["target depth", "categories", "passes", "decode med",
+                       "±IQR", "TTFT p50", "ITL 99% high"]
+        out.append(_table(
+            "Decode at high context · reuses each prefill pass's context",
+            headers, body))
     if not out:
         return ""
     return f"""  <details open>
@@ -258,6 +286,7 @@ def render_sections(results: dict) -> dict:
     rows = single_rows(results)
     conc = concurrency_rows(results)
     pre = prefill_rows(results)
+    hctx = high_ctx_decode_rows(results)
     comb = combined_score(results, rows)
     batched = report_is_batched(rows)
     rrows = reasoning_rows(results)
@@ -352,7 +381,7 @@ def render_sections(results: dict) -> dict:
         "header": _header(results, cfg, env),
         "tiles": _tiles(comb, conc, pre, cfg, batched),
         "figures": "\n".join(figs),
-        "tables": _tables(rows, conc, pre, env, batched, rrows),
+        "tables": _tables(rows, conc, pre, hctx, env, batched, rrows),
         "footer": _footer(results, env, cfg),
         "data": data,
     }
