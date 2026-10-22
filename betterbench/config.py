@@ -37,6 +37,17 @@ class Config:
     prefill_max_tokens: int = 16     # keep decode tiny so TTFT is dominated by prefill
     prefill_ctx_margin: int = 256    # headroom (chat template/system tokens) when ctx-checking
 
+    # high-context decode — right after each prefill pass, decode against the
+    # SAME context that pass just processed, so the decode runs with a long KV
+    # cache already in place (the RAG shape: long context, short answer).
+    # Auto-disabled when the prefill sweep is off: there is no context to reuse.
+    run_high_ctx_decode: bool = True
+    high_ctx_decode_tokens: int = 256    # tokens to decode per pass
+    # Which corpus categories supply the appended task prompt. None = resolve
+    # from the main decode's categories (all of them, or just the first under
+    # --quick). Set explicitly to measure a different mix than the main decode.
+    high_ctx_categories: list[str] | None = None
+
     # context window: override the model's max context; if None it is auto-detected
     # from GET /v1/models (max_model_len). Depths that don't fit are skipped, not run.
     max_model_len: int | None = None

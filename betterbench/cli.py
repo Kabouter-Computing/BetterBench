@@ -151,17 +151,29 @@ def cmd_run(args):
         "runs_per_category": passes, "warmup": warmup,
         "greedy": args.greedy or None,
         "seed": args.seed, "max_model_len": args.max_model_len,
+        "run_high_ctx_decode": False if args.no_high_ctx_decode else None,
+        "high_ctx_categories": args.high_ctx_categories or None,
         **_phase_overrides(args),
     })
+    # The high-context decode reuses the prefill sweep's context, so it has
+    # nothing to reuse when the prefill sweep is off. Settle it here so the
+    # recorded config is honest, not just the behaviour.
+    if not cfg.run_prefill:
+        cfg.run_high_ctx_decode = False
     phases = [name for name, field in PHASES.items() if getattr(cfg, field)]
     if not phases:
         sys.exit("every phase is switched off — nothing to measure. Pass "
                  "--decode, --prefill or --concurrency to pick one.")
     # The prefill sweep synthesises its own prompts by depth, so a prefill-only
-    # run neither needs a corpus nor should record one it never read.
-    needs_corpus = cfg.run_single_stream or cfg.run_concurrency
+    # run neither needs a corpus nor should record one it never read. The
+    # high-context decode is the exception: it appends a real task prompt, so
+    # it needs the corpus — but a missing corpus skips it rather than errors,
+    # because the prefill sweep itself is corpus-free.
+    hard_needs_corpus = cfg.run_single_stream or cfg.run_concurrency
+    soft_needs_corpus = cfg.run_prefill and cfg.run_high_ctx_decode
+    needs_corpus = hard_needs_corpus or soft_needs_corpus
     corpus = load_corpus(args.corpus, args.categories) if needs_corpus else {}
-    if not corpus and needs_corpus:
+    if not corpus and hard_needs_corpus:
         if args.corpus:
             sys.exit(f"no prompts found in --corpus {args.corpus!r} "
                      f"(need *.jsonl files; check --categories {args.categories})")
@@ -171,6 +183,20 @@ def cmd_run(args):
                  "\nIf you installed with `pip install -e .`, this is a known "
                  "path issue — update to the latest version, or pass "
                  "--corpus /path/to/corpus/v1 explicitly.")
+    # Resolve the high-context decode's categories. An explicit
+    # --high-ctx-categories wins; under --quick the first main-decode category
+    # is enough for a smoke run; otherwise the full main-decode set.
+    hctx_cats: list[str] | None = None
+    if cfg.run_prefill and cfg.run_high_ctx_decode:
+        if not corpus:
+            cfg.run_high_ctx_decode = False
+            print("high-context decode: skipped (no corpus to draw task prompts from)")
+        elif cfg.high_ctx_categories:
+            hctx_cats = list(cfg.high_ctx_categories)
+        elif args.quick:
+            hctx_cats = [next(iter(corpus))]
+        else:
+            hctx_cats = list(corpus.keys())
     banner = f"BetterBench {__version__} · corpus v{CORPUS_VERSION}"
     if needs_corpus:
         banner += (f" · {sum(len(v) for v in corpus.values())} prompts "
@@ -180,6 +206,9 @@ def cmd_run(args):
     if cfg.run_single_stream:
         print(f"{cfg.warmup} warmup + {cfg.runs_per_category} measured passes per category"
               f"{'  (quick mode — smoke check, not a publishable result)' if args.quick else ''}")
+    if cfg.run_prefill and cfg.run_high_ctx_decode:
+        print(f"high-context decode: {cfg.high_ctx_decode_tokens} tokens after each "
+              f"prefill pass · categories: {', '.join(hctx_cats or [])}")
 
     results = {
         "schema": RESULTS_SCHEMA,
@@ -226,9 +255,13 @@ def cmd_run(args):
         results["single_stream"] = asyncio.run(
             single_stream(args.endpoint, args.model, corpus, cfg, api_key=api_key))
     if cfg.run_prefill:
-        results["prefill"] = asyncio.run(
+        prefill_rows, hctx_rows = asyncio.run(
             prefill_sweep(args.endpoint, args.model, cfg, max_ctx=max_ctx,
-                          api_key=api_key))
+                          api_key=api_key, corpus=corpus,
+                          high_ctx_categories=hctx_cats))
+        results["prefill"] = prefill_rows
+        if hctx_rows:
+            results["high_ctx_decode"] = hctx_rows
     if cfg.run_concurrency:
         results["concurrency"] = asyncio.run(
             concurrency_sweep(args.endpoint, args.model, corpus, cfg,
@@ -366,6 +399,13 @@ def main(argv=None):
                        const="concurrency", help="concurrency sweep only")
     r.add_argument("--no-concurrency", action="store_true", help="skip the concurrency sweep")
     r.add_argument("--no-prefill", action="store_true", help="skip the prompt-processing sweep")
+    r.add_argument("--no-high-ctx-decode", action="store_true",
+                   help="skip the high-context decode that follows each prefill pass "
+                        "(auto-skipped when --no-prefill is set)")
+    r.add_argument("--high-ctx-categories", nargs="*", default=None, metavar="CAT",
+                   help="corpus categories whose task prompt is appended for the "
+                        "high-context decode (default: the main decode's categories; "
+                        "under --quick, just the first of them)")
     r.add_argument("--max-model-len", type=int,
                    help="model context window in tokens; overrides auto-detection. "
                         "Prefill depths that don't fit are skipped instead of erroring.")

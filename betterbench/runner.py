@@ -107,7 +107,10 @@ async def concurrency_sweep(endpoint: str, model: str,
 # --------------------------------------------------------------------------- #
 async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
                         max_ctx: int | None = None,
-                        api_key: str | None = None) -> list[dict]:
+                        api_key: str | None = None,
+                        corpus: dict[str, list[Prompt]] | None = None,
+                        high_ctx_categories: list[str] | None = None
+                        ) -> tuple[list[dict], list[dict]]:
     """Sweep prefill throughput vs input depth.
 
     Depths that can't fit the model's context window are skipped rather than
@@ -120,12 +123,36 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
     The nonce RNG is seeded from OS entropy, so no two invocations send the
     same prompt: a lane that keeps its cache warm between runs (a RAM/SSD KV
     tier) has nothing from a previous run to serve back.
+
+    When the high-context decode is enabled (and a corpus is supplied), each
+    prefill pass is immediately followed by a decode against the *same*
+    context that pass just processed — the prefill prompt verbatim, with a
+    short task prompt from one of `high_ctx_categories` appended. The prefill
+    prompt is a strict prefix of the decode prompt, so a backend with prefix
+    caching reuses the KV it just built, and one without re-prefills it (the
+    cost lands in the decode's TTFT, not its decode t/s). Either way the
+    decode runs with a long context in the KV cache — the RAG shape. Returns
+    ``(prefill_rows, high_ctx_decode_rows)``.
     """
     # Entropy-seeded on purpose: a fixed seed replays the same nonces, hence the
     # same prompts, on every run, and a persistent KV tier (RAM/SSD) would serve
     # them back from the previous run.
     rng = random.Random()
     out = []
+    hctx_out = []
+
+    # High-context decode: flatten the selected categories' prompts into one
+    # rotation list. A missing/empty corpus (or no prompts in the chosen
+    # categories) disables it for the whole sweep — the prefill sweep itself
+    # builds its own prompts and is unaffected.
+    do_hctx = bool(cfg.run_high_ctx_decode and corpus and high_ctx_categories)
+    hctx_flat: list[Prompt] = []
+    if do_hctx:
+        hctx_flat = [p for c in high_ctx_categories for p in corpus.get(c, [])]
+        if not hctx_flat:
+            log(f"[hctx] no prompts in categories {high_ctx_categories} — "
+                f"skipping the high-context decode")
+            do_hctx = False
 
     def skip_row(depth: int, reason: str) -> dict:
         return {"target_depth": depth, "skipped": True, "reason": reason,
@@ -137,17 +164,20 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
         if max_ctx is not None and need > max_ctx:
             log(f"[prefill] skip depth ~{depth}: needs ~{need} tok > model context {max_ctx}")
             out.append(skip_row(depth, f"exceeds max context {max_ctx} (needs ~{need} tok)"))
+            if do_hctx:
+                hctx_out.append(_hctx_skip_row(depth, high_ctx_categories,
+                                               "prefill depth skipped"))
             continue
 
-        log(f"[prefill] depth ~{depth} tok: warmup {cfg.prefill_warmup} + {cfg.prefill_runs}")
+        log(f"[prefill] depth ~{depth} tok: warmup {cfg.prefill_warmup} + {cfg.prefill_runs}"
+            + ("  (+ high-ctx decode)" if do_hctx else ""))
 
-        async def one():
+        async def one(nonce_: str | None):
             # A fresh nonce per pass reseeds the body as well as tagging the
             # front, so no block of this prompt has been seen before; None
             # asks for the identical, cacheable prompt every time.
-            msgs = make_prefill_messages(
-                depth, nonce(rng) if cfg.unique_nonce else None)
-            return await stream_chat(endpoint, model, msgs,
+            msgs = make_prefill_messages(depth, nonce_)
+            return msgs, await stream_chat(endpoint, model, msgs,
                                      max_tokens=cfg.prefill_max_tokens, temperature=0.0,
                                      top_p=cfg.top_p, top_k=cfg.top_k, seed=cfg.seed,
                                      category="prefill", prompt_id=f"pp{depth}",
@@ -155,16 +185,39 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
 
         rejected = False
         recs = []
-        for _ in range(cfg.prefill_warmup + cfg.prefill_runs):
-            r = await one()
+        hctx_recs: list[RunResult] = []
+        hctx_rejected = False
+        for i in range(cfg.prefill_warmup + cfg.prefill_runs):
+            n = nonce(rng) if cfg.unique_nonce else None
+            msgs, r = await one(n)
             if is_context_length_error(r.error):
                 rejected = True
                 break
             recs.append(r)
+            # High-context decode: reuse the EXACT context this prefill pass
+            # just processed. `msgs` is the prefill prompt verbatim (same
+            # nonce, same body); the task prompt is appended, so `msgs` is a
+            # strict prefix of the decode prompt.
+            if do_hctx:
+                task = hctx_flat[i % len(hctx_flat)]
+                r_h = await stream_chat(
+                    endpoint, model, msgs + task.messages,
+                    max_tokens=cfg.high_ctx_decode_tokens,
+                    temperature=cfg.effective_temp(), top_p=cfg.top_p,
+                    top_k=cfg.top_k, seed=cfg.seed,
+                    category=task.category, prompt_id=task.id,
+                    timeout=cfg.timeout_s, api_key=api_key)
+                if is_context_length_error(r_h.error):
+                    hctx_rejected = True
+                    break
+                hctx_recs.append(r_h)
         if rejected:
             log(f"[prefill] skip depth ~{depth}: server rejected (context length "
                 f"exceeded){'' if max_ctx else '; consider --max-model-len'}")
             out.append(skip_row(depth, "server rejected: exceeds context length"))
+            if do_hctx:
+                hctx_out.append(_hctx_skip_row(depth, high_ctx_categories,
+                                               "prefill depth skipped"))
             continue
 
         measured = recs[cfg.prefill_warmup:]          # drop warmup
@@ -183,7 +236,58 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
                               if r.cached_tokens is not None],
             "batched_runs": sum(1 for r in ok if r.chunk_token_mismatch),
         })
-    return out
+
+        if do_hctx:
+            if hctx_rejected:
+                log(f"[hctx] skip depth ~{depth}: server rejected the decode "
+                    f"(context length exceeded) — the decode needs "
+                    f"~{cfg.high_ctx_decode_tokens} more tokens of headroom than "
+                    f"the prefill probe")
+                hctx_out.append(_hctx_skip_row(
+                    depth, high_ctx_categories,
+                    "server rejected: decode exceeds context length"))
+                continue
+            hctx_measured = hctx_recs[cfg.prefill_warmup:]   # drop warmup
+            for r in hctx_measured:
+                if not r.ok:
+                    log(f"  ! high-ctx decode depth {depth}: {r.error}")
+            hctx_out.append(_hctx_row(depth, hctx_measured, high_ctx_categories))
+    return out, hctx_out
+
+
+def _hctx_skip_row(depth: int, categories: list[str], reason: str) -> dict:
+    return {"target_depth": depth, "skipped": True, "reason": reason,
+            "categories": list(categories), "runs": 0,
+            "decode_tps": [], "ttft_ms": [], "update_gaps_ms": [],
+            "tokens_per_update": [], "completion_tokens": [], "batched_runs": 0}
+
+
+def _hctx_row(depth: int, recs: list[RunResult],
+              categories: list[str]) -> dict:
+    """Aggregate one depth's high-context decode passes into a report row.
+
+    Mirrors the prefill row's flat-list style: per-run scalars plus one
+    flattened gap series, so the report can take ITL percentiles without the
+    file carrying a nested per-run transcript.
+    """
+    ok = [r for r in recs if r.ok]
+    if not ok:
+        return _hctx_skip_row(depth, categories,
+                              "all high-context decode passes failed")
+    gaps = [x for r in ok for x in r.update_gaps_ms]
+    return {
+        "target_depth": depth, "skipped": False,
+        "categories": list(categories),
+        "runs": len(ok),
+        "decode_tps": [r.decode_tps for r in ok if r.decode_tps],
+        "ttft_ms": [r.ttft_ms for r in ok if r.ttft_ms],
+        "update_gaps_ms": gaps,
+        "tokens_per_update": [r.tokens_per_update for r in ok
+                              if r.tokens_per_update],
+        "completion_tokens": [r.completion_tokens for r in ok
+                              if r.completion_tokens],
+        "batched_runs": sum(1 for r in ok if r.chunk_token_mismatch),
+    }
 
 
 # --------------------------------------------------------------------------- #

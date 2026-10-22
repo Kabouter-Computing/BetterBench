@@ -200,6 +200,11 @@ def sample_gate(results: dict) -> dict:
     for d in prefill_rows(results):
         if not d["skipped"]:
             check("prefill", d["target_depth"], "pp_p99", d["pp_n"])
+    for d in high_ctx_decode_rows(results):
+        if not d["skipped"]:
+            check("high_ctx_decode", d["target_depth"], "ttft_p99", d["ttft_n"])
+            check("high_ctx_decode", d["target_depth"],
+                  "update_p99" if d["batched"] else "itl_high99", d["gap_n"])
     return {"rule": "n * min(pct, 100-pct) / 100 >= 5", "under_sampled": under}
 
 
@@ -246,6 +251,49 @@ def prefill_rows(results: dict) -> list[dict]:
             "pp_n": pp.n,
             "pp_tail_ok": enough_samples_for_percentile(pp.n, 99),
         })
+    return rows
+
+
+def high_ctx_decode_rows(results: dict) -> list[dict]:
+    """Per-depth high-context decode rows. Shared by the markdown and HTML reports.
+
+    The decode runs against the prefill sweep's own context, so the rows are
+    keyed by the same target depth. The latency columns follow the same
+    per-token-vs-batched rule as the single-stream table: ITL only when the
+    server streams one token per update.
+    """
+    rows = []
+    for d in results.get("high_ctx_decode", []):
+        if d.get("skipped"):
+            rows.append({"target_depth": d["target_depth"], "skipped": True,
+                         "reason": d.get("reason", "")})
+            continue
+        dd = summarize(d.get("decode_tps", []))
+        td = summarize(d.get("ttft_ms", []))
+        gaps = d.get("update_gaps_ms", [])
+        batched = d.get("batched_runs", 0) > 0
+        gap_d = summarize(gaps)
+        row = {
+            "target_depth": d["target_depth"], "skipped": False,
+            "categories": d.get("categories", []),
+            "runs": d.get("runs", 0),
+            "decode_med": dd.median, "decode_iqr": dd.iqr, "decode_cv": dd.cv,
+            "ttft_p50": td.median, "ttft_n": td.n,
+            "ttft_p99_ok": enough_samples_for_percentile(td.n, 99),
+            "gap_n": len(gaps),
+            "tail_ok": enough_samples_for_percentile(len(gaps), 99),
+            "batched": batched,
+            # Measured wall-clock gap between stream updates (the batched column).
+            "update_p50": gap_d.median if gaps else None,
+            "update_p99": gap_d.p99 if gaps else None,
+        }
+        if batched or not gaps:
+            row.update(itl_low1=None, itl_med=None, itl_high99=None)
+        else:
+            rate_d = summarize(itl_to_rate_samples(gaps), rate_like=True)
+            row.update(itl_low1=rate_d.low_1pct, itl_med=rate_d.median,
+                       itl_high99=rate_d.p99)
+        rows.append(row)
     return rows
 
 
@@ -425,6 +473,46 @@ def render_markdown(results: dict) -> str:
             L.append(f"\n*Skipped {', '.join(skipped)} — input depth exceeds the model's "
                      f"context window{ctx_txt}; raise it or pass `--max-model-len` to bench "
                      f"deeper.*")
+        L.append("")
+
+    hctx = results.get("high_ctx_decode", [])
+    if hctx:
+        rows = high_ctx_decode_rows(results)
+        batched = any(r.get("batched") for r in rows if not r["skipped"])
+        L.append("## Decode at high context\n")
+        L.append("Decode throughput after a long prefill, at increasing context depth. "
+                 "Each pass reuses the prefill sweep's own prompt as context — the "
+                 "decode runs with a long KV cache already in place, the RAG shape "
+                 "(long context, short answer). TTFT in ms includes re-prefilling the "
+                 "context on a backend without prefix caching; decode t/s does not.")
+        if batched:
+            L.append("\nThis server packs several tokens into one stream update, so "
+                     "there is no per-token latency — **update p50/p99** is the "
+                     "measured wall-clock gap between updates.\n")
+            L.append("| target depth | categories | passes | decode t/s (med) | ±IQR | TTFT p50 (ms) | update p50 (ms) | update p99 (ms) |")
+            L.append("|--:|---|--:|--:|--:|--:|--:|--:|")
+            for r in rows:
+                if r["skipped"]:
+                    L.append(f"| {r['target_depth']} | — | — | — | — | — | _skipped_ | — |")
+                    continue
+                L.append(f"| {r['target_depth']} | {', '.join(r['categories'])} | "
+                         f"{r['runs']} | {_fmt(r['decode_med'])} | {_fmt(r['decode_iqr'])} | "
+                         f"{_fmt(r['ttft_p50'])} | {_fmt(r.get('update_p50'))} | "
+                         f"{_gate(r.get('update_p99'), r['tail_ok'])} |")
+        else:
+            L.append("\nITL columns are tokens/sec (1% low = slowest tokens, median, "
+                     "99% high = fastest); this server streams one token per update, so "
+                     "the update gap *is* the inter-token latency.\n")
+            L.append("| target depth | categories | passes | decode t/s (med) | ±IQR | TTFT p50 (ms) | ITL 1% low | ITL median | ITL 99% high |")
+            L.append("|--:|---|--:|--:|--:|--:|--:|--:|--:|")
+            for r in rows:
+                if r["skipped"]:
+                    L.append(f"| {r['target_depth']} | — | — | — | — | — | _skipped_ | — | — |")
+                    continue
+                L.append(f"| {r['target_depth']} | {', '.join(r['categories'])} | "
+                         f"{r['runs']} | {_fmt(r['decode_med'])} | {_fmt(r['decode_iqr'])} | "
+                         f"{_fmt(r['ttft_p50'])} | {_gate(r['itl_low1'], r['tail_ok'])} | "
+                         f"{_fmt(r['itl_med'])} | {_gate(r['itl_high99'], r['tail_ok'])} |")
         L.append("")
 
     L.append("---")
