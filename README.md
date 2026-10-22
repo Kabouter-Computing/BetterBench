@@ -203,6 +203,17 @@ Cold across runs too. The nonce RNG is seeded from OS entropy, so no two invocat
 the same prompt, and a server that keeps its cache warm between runs (a RAM/SSD KV tier) has
 nothing to serve back.
 
+**Decode at high context** — right after each prefill pass, BetterBench decodes against the
+*same* context that pass just processed: the prefill prompt verbatim, with a short task prompt
+from a corpus category appended. The prefill prompt is a strict prefix of the decode prompt, so
+a backend with prefix caching reuses the KV it just built and one without re-prefills it (the
+cost lands in the decode's TTFT, not its decode t/s). Either way the decode runs with a long
+context in the KV cache — the RAG shape: long context, short answer. It reports decode t/s and
+the latency columns (ITL, or update gaps on a speculative server) at each depth. Off with
+`--no-high-ctx-decode` (auto-off when `--no-prefill` is set); `--high-ctx-categories` picks a
+different category mix than the main decode, and under `--quick` it measures just the first
+main-decode category.
+
 **Run length you control** — `--passes N` sets the measured passes per category (default 20)
 and `--warmup N` the discarded ones; both override whatever a `--config` file says. `--quick`
 is the shorthand for a smoke run — 5 passes after 1 warmup — for checking that an endpoint,

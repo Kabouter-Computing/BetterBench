@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.0
+
+**Upgrading:** `betterbench run` is now a little longer — each prefill pass is followed by a
+short decode against the same context (the new high-context decode, on by default). Disable it
+with `--no-high-ctx-decode` to get the old run length. `results.json` gains a `high_ctx_decode`
+section; older files render fine without it.
+
+### Added
+
+- **Decode at high context.** Right after each prefill pass, BetterBench now decodes against
+  the *same* context that pass just processed — the prefill prompt verbatim, with a short task
+  prompt from a corpus category appended. The prefill prompt is a strict prefix of the decode
+  prompt, so a backend with prefix caching reuses the KV it just built and one without
+  re-prefills it (the cost lands in the decode's TTFT, not its decode t/s). Either way the
+  decode runs with a long context in the KV cache — the RAG shape: long context, short answer.
+  The report gains a per-depth "Decode at high context" table (markdown and HTML), and the
+  percentiles join the `sample_gate` honesty check.
+  - `--no-high-ctx-decode` turns it off (auto-off when `--no-prefill` is set, since there is
+    then no context to reuse).
+  - `--high-ctx-categories CAT…` picks a category mix independent of the main decode; by
+    default it uses the main decode's categories, or just the first of them under `--quick`.
+  - `high_ctx_decode_tokens` (config file, default 256) sets how many tokens each pass decodes.
+
 ## 0.6.1
 
 **Upgrading:** prefill throughput may read lower again on servers whose KV

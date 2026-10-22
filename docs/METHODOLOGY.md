@@ -34,6 +34,29 @@ server's reported `usage`.
   at runtime also marks that depth skipped rather than aborting the sweep. Skipped depths are
   recorded in `results.json` and shown as `skipped` in the report.
 
+### Decode at high context
+The prefill sweep measures how fast a server *builds* a long KV cache. Decode at high context
+measures the other half of the RAG shape: how fast it *generates* once that cache is in place.
+Right after each prefill pass, BetterBench sends a decode request whose prompt is the prefill
+prompt **verbatim** (same nonce, same body) with a short task prompt from a chosen corpus
+category appended. Two properties follow from that construction:
+
+- **The context is always present in the decode's KV cache.** The prefill prompt is a strict
+  prefix of the decode prompt, so a backend with prefix caching reuses the KV the prefill pass
+  just built, and one without re-prefills it. In the latter case the re-prefill cost lands in
+  the decode's **TTFT**, not its **decode t/s** — so decode t/s is a clean read of
+  generation speed at that context depth, while TTFT is an upper bound that includes the
+  re-prefill on a non-caching backend.
+- **The decode is a real task, not `ack`.** The appended prompt comes from the corpus, so the
+  model generates a meaningful answer (default `high_ctx_decode_tokens` = 256 tokens) rather
+  than the one-word reply the prefill probe asks for.
+
+The category mix is independent of the main decode: `--high-ctx-categories` selects it,
+defaulting to the main decode's categories (or just the first of them under `--quick`). It is
+auto-disabled when the prefill sweep is off, since there is then no context to reuse. A depth
+whose decode exceeds the context window is marked `skipped` for the decode while the prefill
+row for that depth is unaffected.
+
 Reasoning-channel tokens (`reasoning` / `reasoning_content`) are counted as generated tokens;
 TTFT is time to the first token of *any* channel — which on a thinking model is the first
 *thinking* token, a wait nobody experiences. **TTFA** (time to first answer) is reported
