@@ -169,8 +169,22 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
                                                "prefill depth skipped"))
             continue
 
+        # The decode needs more headroom than the prefill probe (a larger
+        # max_tokens, plus the appended task prompt). When the window is known,
+        # drop the decode up front for a depth that fits the prefill but not the
+        # decode, so the prefill row stays complete and the decode is a clean
+        # skip. This is a best-effort bound (it omits the task prompt's own
+        # tokens); a runtime context-length rejection is the authoritative check.
+        hctx_fits = True
+        if do_hctx and max_ctx is not None:
+            hctx_need = depth + cfg.high_ctx_decode_tokens + cfg.prefill_ctx_margin
+            if hctx_need > max_ctx:
+                hctx_fits = False
+                log(f"[hctx] skip depth ~{depth}: decode needs ~{hctx_need} tok "
+                    f"> model context {max_ctx}")
+
         log(f"[prefill] depth ~{depth} tok: warmup {cfg.prefill_warmup} + {cfg.prefill_runs}"
-            + ("  (+ high-ctx decode)" if do_hctx else ""))
+            + ("  (+ high-ctx decode)" if do_hctx and hctx_fits else ""))
 
         async def one(nonce_: str | None):
             # A fresh nonce per pass reseeds the body as well as tagging the
@@ -197,8 +211,10 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
             # High-context decode: reuse the EXACT context this prefill pass
             # just processed. `msgs` is the prefill prompt verbatim (same
             # nonce, same body); the task prompt is appended, so `msgs` is a
-            # strict prefix of the decode prompt.
-            if do_hctx:
+            # strict prefix of the decode prompt. A context-length rejection
+            # stops the decode for this depth but keeps the prefill running, so
+            # the prefill row stays complete.
+            if do_hctx and hctx_fits and not hctx_rejected:
                 task = hctx_flat[i % len(hctx_flat)]
                 r_h = await stream_chat(
                     endpoint, model, msgs + task.messages,
@@ -209,7 +225,11 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
                     timeout=cfg.timeout_s, api_key=api_key)
                 if is_context_length_error(r_h.error):
                     hctx_rejected = True
-                    break
+                    log(f"[hctx] skip depth ~{depth}: server rejected the decode "
+                        f"(context length exceeded) — the decode needs "
+                        f"~{cfg.high_ctx_decode_tokens} more tokens of headroom than "
+                        f"the prefill probe")
+                    continue
                 hctx_recs.append(r_h)
         if rejected:
             log(f"[prefill] skip depth ~{depth}: server rejected (context length "
@@ -238,11 +258,12 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
         })
 
         if do_hctx:
+            if not hctx_fits:
+                hctx_out.append(_hctx_skip_row(
+                    depth, high_ctx_categories,
+                    f"decode exceeds max context {max_ctx}"))
+                continue
             if hctx_rejected:
-                log(f"[hctx] skip depth ~{depth}: server rejected the decode "
-                    f"(context length exceeded) — the decode needs "
-                    f"~{cfg.high_ctx_decode_tokens} more tokens of headroom than "
-                    f"the prefill probe")
                 hctx_out.append(_hctx_skip_row(
                     depth, high_ctx_categories,
                     "server rejected: decode exceeds context length"))
@@ -255,15 +276,15 @@ async def prefill_sweep(endpoint: str, model: str, cfg: Config, log=print,
     return out, hctx_out
 
 
-def _hctx_skip_row(depth: int, categories: list[str], reason: str) -> dict:
+def _hctx_skip_row(depth: int, categories: list[str] | None, reason: str) -> dict:
     return {"target_depth": depth, "skipped": True, "reason": reason,
-            "categories": list(categories), "runs": 0,
+            "categories": list(categories or []), "runs": 0,
             "decode_tps": [], "ttft_ms": [], "update_gaps_ms": [],
             "tokens_per_update": [], "completion_tokens": [], "batched_runs": 0}
 
 
 def _hctx_row(depth: int, recs: list[RunResult],
-              categories: list[str]) -> dict:
+              categories: list[str] | None) -> dict:
     """Aggregate one depth's high-context decode passes into a report row.
 
     Mirrors the prefill row's flat-list style: per-run scalars plus one
@@ -277,7 +298,7 @@ def _hctx_row(depth: int, recs: list[RunResult],
     gaps = [x for r in ok for x in r.update_gaps_ms]
     return {
         "target_depth": depth, "skipped": False,
-        "categories": list(categories),
+        "categories": list(categories or []),
         "runs": len(ok),
         "decode_tps": [r.decode_tps for r in ok if r.decode_tps],
         "ttft_ms": [r.ttft_ms for r in ok if r.ttft_ms],

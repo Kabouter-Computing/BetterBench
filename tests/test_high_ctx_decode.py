@@ -120,6 +120,44 @@ def test_no_corpus_disables_high_ctx_decode(monkeypatch):
     assert hctx_rows == []                     # decode skipped
 
 
+def test_decode_rejection_keeps_the_prefill_row_complete(monkeypatch):
+    """If the server rejects the decode for context length, the prefill passes
+    keep running (the prefill row is complete) and only the decode is skipped."""
+    calls: list[tuple[list[dict], int]] = []
+
+    def fake_stream_chat(endpoint, model, messages, **kw):
+        # The decode asks for more tokens; reject it with a context-length error.
+        if kw.get("max_tokens", 0) > 16:
+            calls.append((messages, kw.get("max_tokens", 0)))
+            return RunResult(ok=False,
+                             error="This model's maximum context length is 100 tokens.")
+        calls.append((messages, kw.get("max_tokens", 0)))
+        return _ok_result()
+
+    async def fake_async(endpoint, model, messages, **kw):
+        return fake_stream_chat(endpoint, model, messages, **kw)
+
+    monkeypatch.setattr(runner, "stream_chat", fake_async)
+    cfg = Config()
+    cfg.prefill_depths = [200]
+    cfg.prefill_runs = 3
+    cfg.prefill_warmup = 1
+    cfg.run_high_ctx_decode = True
+
+    prefill_rows, hctx_rows = asyncio.run(
+        runner.prefill_sweep("http://x", "m", cfg, corpus=_corpus(),
+                             high_ctx_categories=["code"]))
+    # All prefill passes ran (warmup + measured), even though the decode was
+    # rejected on the first pass.
+    prefill_calls = [c for c in calls if c[1] <= 16]
+    assert len(prefill_calls) == cfg.prefill_warmup + cfg.prefill_runs
+    # The prefill row is complete (measured passes only).
+    assert len(prefill_rows) == 1 and not prefill_rows[0].get("skipped")
+    assert len(prefill_rows[0]["ttft_ms"]) == cfg.prefill_runs
+    # The decode row is a clean skip.
+    assert len(hctx_rows) == 1 and hctx_rows[0]["skipped"]
+
+
 # --------------------------------------------------------------------------- #
 # Integration: the flag surface, end to end against the mock server
 # --------------------------------------------------------------------------- #
